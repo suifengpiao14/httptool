@@ -22,6 +22,7 @@ func deepCopyHeader(h http.Header) http.Header {
 
 // CopyRequest 深拷贝 http.Request，Body 可重复读取
 func CopyRequest(r *http.Request, body []byte) (copyRequest *http.Request, reqBody []byte, err error) {
+	reqBody = body
 	if r == nil {
 		return nil, nil, nil
 	}
@@ -55,19 +56,23 @@ func CopyRequest(r *http.Request, body []byte) (copyRequest *http.Request, reqBo
 	}
 
 	if r.Body != nil {
-		reqBody, err = io.ReadAll(r.Body)
-		r.Body.Close()
-		if err != nil {
-			return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
+		if r.ContentLength == 0 { // 如果内容为空，则直接返回空 body，不复制原始 request body，这样可以提升效率，同时能保持不修改原始 request body 对象
+			reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+		} else {
+			reqBody, err = io.ReadAll(r.Body)
+			r.Body.Close()
+			if err != nil {
+				return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
+			}
+
+			// 恢复原始 request
+			r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
+
+			// 复制用 body
+			reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+			reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
 		}
-
-		// 恢复原始 request
-		r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
-
-		// 复制用 body
-		reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
-		reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
 	}
 
 	return reqCopy, reqBody, nil
@@ -92,15 +97,21 @@ func CopyResponse(resp *http.Response, body []byte) (copyResponse *http.Response
 	}
 
 	if resp.Body != nil {
-		rspBody, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, rspBody, err
+		if resp.ContentLength == 0 {
+			// 如果内容为空，则直接返回空 body，不复制原始 response body，这样可以提升效率，同时能保持不修改原始 response body 对象，在（github.com/elazarl/goproxy 中会根据这个对象是否发生变化删除Content-length 字段 ,导致HEAD——没有body 请求无法中断）
+			respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+		} else {
+			rspBody, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, rspBody, err
+			}
+			// 恢复原始 response
+			resp.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+			// 复制用 body
+			respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
 		}
-		// 恢复原始 response
-		resp.Body = io.NopCloser(bytes.NewBuffer(rspBody))
-		// 复制用 body
-		respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+
 	}
 
 	return &respCopy, rspBody, nil
