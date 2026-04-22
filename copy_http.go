@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httputil"
 )
 
 // deepCopyHeader 深拷贝 http.Header
@@ -115,4 +116,23 @@ func CopyResponse(resp *http.Response, body []byte) (copyResponse *http.Response
 	}
 
 	return &respCopy, rspBody, nil
+}
+
+func DumpRequest(req *http.Request) string {
+	reqRaw, err := httputil.DumpRequest(req, true) // 服务端
+	if err != nil {
+		reqRaw, err = httputil.DumpRequestOut(req, true) // 客户端
+		if err != nil {
+			reqRaw = []byte(err.Error())
+		}
+	}
+	return string(reqRaw)
+}
+
+func DumpResponse(rsp *http.Response) string {
+	rspRaw, err := httputil.DumpResponse(rsp, true)
+	if err != nil {
+		rspRaw = []byte(err.Error())
+	}
+	return string(rspRaw)
 }
