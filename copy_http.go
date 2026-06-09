@@ -5,7 +5,24 @@ import (
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"sync"
 )
+
+// bufPool 复用 bytes.Buffer，减少 io.ReadAll 的频繁内存分配
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// pooledReadAll 替代 io.ReadAll，复用 buffer 减少分配
+func pooledReadAll(r io.Reader) ([]byte, error) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+	_, err := buf.ReadFrom(r)
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+	return result, err
+}
 
 // deepCopyHeader 深拷贝 http.Header
 func deepCopyHeader(h http.Header) http.Header {
@@ -47,7 +64,7 @@ func CopyRequest(r *http.Request, body []byte) (copyRequest *http.Request, reqBo
 			return reqCopy, reqBody, err
 		}
 		defer bodyReader.Close()
-		reqBody, err = io.ReadAll(bodyReader) // 读取原始 request body
+		reqBody, err = pooledReadAll(bodyReader) // 读取原始 request body
 		if err != nil {
 			return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
 		}
@@ -60,7 +77,7 @@ func CopyRequest(r *http.Request, body []byte) (copyRequest *http.Request, reqBo
 		if r.ContentLength == 0 { // 如果内容为空，则直接返回空 body，不复制原始 request body，这样可以提升效率，同时能保持不修改原始 request body 对象
 			reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 		} else {
-			reqBody, err = io.ReadAll(r.Body)
+			reqBody, err = pooledReadAll(r.Body)
 			r.Body.Close()
 			if err != nil {
 				return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
@@ -88,7 +105,11 @@ func CopyResponse(resp *http.Response, body []byte) (copyResponse *http.Response
 	respCopy := *resp // 浅拷贝结构体
 	respCopy.Header = deepCopyHeader(resp.Header)
 	respCopy.Trailer = deepCopyHeader(resp.Trailer)
-	respCopy.Request, _, _ = CopyRequest(resp.Request, nil) // request 可能已经被读取，所以需要忽略错误
+	if resp.Request != nil {
+		respCopy.Request = resp.Request // 已有 request 引用，不重复复制 body
+	} else {
+		respCopy.Request, _, _ = CopyRequest(resp.Request, nil)
+	}
 	// if err != nil {
 	// 	return nil, err
 	// }
@@ -102,7 +123,7 @@ func CopyResponse(resp *http.Response, body []byte) (copyResponse *http.Response
 			// 如果内容为空，则直接返回空 body，不复制原始 response body，这样可以提升效率，同时能保持不修改原始 response body 对象，在（github.com/elazarl/goproxy 中会根据这个对象是否发生变化删除Content-length 字段 ,导致HEAD——没有body 请求无法中断）
 			respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
 		} else {
-			rspBody, err = io.ReadAll(resp.Body)
+			rspBody, err = pooledReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
 				return nil, rspBody, err
