@@ -5,135 +5,128 @@ import (
 	"io"
 	"net/http"
 	"net/http/httputil"
-	"sync"
 )
 
-// bufPool 复用 bytes.Buffer，减少 io.ReadAll 的频繁内存分配
-var bufPool = sync.Pool{
-	New: func() any { return new(bytes.Buffer) },
-}
-
-// pooledReadAll 替代 io.ReadAll，复用 buffer 减少分配
-func pooledReadAll(r io.Reader) ([]byte, error) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer bufPool.Put(buf)
-	_, err := buf.ReadFrom(r)
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	return result, err
-}
-
-// deepCopyHeader 深拷贝 http.Header
-func deepCopyHeader(h http.Header) http.Header {
-	if h == nil {
-		return nil
+// newBodyReader 创建一个轻量的、只读的 body reader。
+// 使用 bytes.NewReader 而非 bytes.NewBuffer：
+//  1. NewReader 更轻量（无写入相关字段）；
+//  2. NewReader 不可变，不会被误写，语义更安全；
+//  3. NewReader 支持多次 Seek 复用。
+func newBodyReader(b []byte) io.ReadCloser {
+	if len(b) == 0 {
+		return http.NoBody
 	}
-	copyHeader := make(http.Header, len(h))
-	for k, vv := range h {
-		dst := make([]string, len(vv))
-		copy(dst, vv)
-		copyHeader[k] = dst
-	}
-	return copyHeader
+	return io.NopCloser(bytes.NewReader(b))
 }
 
-// CopyRequest 深拷贝 http.Request，Body 可重复读取
+// makeGetBody 构造 GetBody 闭包，统一使用 bytes.NewReader
+func makeGetBody(b []byte) func() (io.ReadCloser, error) {
+	return func() (io.ReadCloser, error) {
+		return newBodyReader(b), nil
+	}
+}
+
+// CopyRequest 深拷贝 http.Request，Body 可重复读取。
+//
+// 优化点：
+//  1. 不再重复 Clone Header（r.Clone 内部已深拷贝 Header/Trailer）；
+//  2. GetBody 分支与 Body 分支互斥，避免重复读取 body；
+//  3. 统一使用 bytes.NewReader 替代 bytes.NewBuffer，更轻量更安全；
+//  4. 移除 GetBody 闭包的重复赋值。
 func CopyRequest(r *http.Request, body []byte) (copyRequest *http.Request, reqBody []byte, err error) {
 	reqBody = body
 	if r == nil {
 		return nil, nil, nil
 	}
-	// 基于原始 request 克隆
+
+	// 基于原始 request 克隆（Clone 内部已深拷贝 Header、Trailer）
 	reqCopy := r.Clone(r.Context())
 
-	reqCopy.Header = r.Header.Clone()
-	reqCopy.Trailer = deepCopyHeader(r.Trailer)
+	// 如果外部已传入 body，直接使用，无需读取
 	if len(body) > 0 {
-		reqCopy.Body = io.NopCloser(bytes.NewBuffer(body))
-		if r.GetBody == nil {
-			reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(body)), nil }
-		}
-		reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(body)), nil }
+		reqCopy.Body = newBodyReader(body)
+		reqCopy.GetBody = makeGetBody(body)
 		return reqCopy, body, nil
 	}
 
-	if r.GetBody != nil { // 如果有 GetBody，则优先使用 GetBody 获取 body 提升性能
+	// 优先使用 GetBody 获取 body（可重复获取，无需消费原始 Body）
+	if r.GetBody != nil {
 		bodyReader, err := r.GetBody()
 		if err != nil {
 			return reqCopy, reqBody, err
 		}
 		defer bodyReader.Close()
-		reqBody, err = pooledReadAll(bodyReader) // 读取原始 request body
+		reqBody, err = io.ReadAll(bodyReader)
 		if err != nil {
-			return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
+			return reqCopy, reqBody, err
 		}
-		// 复制用 body
-		reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
-		reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
+		reqCopy.Body = newBodyReader(reqBody)
+		reqCopy.GetBody = makeGetBody(reqBody)
+		return reqCopy, reqBody, nil
 	}
 
+	// 没有 GetBody，则从 r.Body 读取（与 GetBody 分支互斥，避免重复读取）
 	if r.Body != nil {
-		if r.ContentLength == 0 { // 如果内容为空，则直接返回空 body，不复制原始 request body，这样可以提升效率，同时能保持不修改原始 request body 对象
-			reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+		if r.ContentLength == 0 {
+			// 内容为空，直接返回空 body，不读取原始 request body
+			reqCopy.Body = newBodyReader(nil)
 		} else {
-			reqBody, err = pooledReadAll(r.Body)
+			reqBody, err = io.ReadAll(r.Body)
 			r.Body.Close()
 			if err != nil {
-				return reqCopy, reqBody, err // CopyResponse 时会忽略err，但是需要reqCopy ，所以这里同步返回reqCopy
+				return reqCopy, reqBody, err
 			}
-
-			// 恢复原始 request
-			r.Body = io.NopCloser(bytes.NewBuffer(reqBody))
-			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
-
+			// 恢复原始 request，使其可重复读取
+			r.Body = newBodyReader(reqBody)
+			r.GetBody = makeGetBody(reqBody)
 			// 复制用 body
-			reqCopy.Body = io.NopCloser(bytes.NewBuffer(reqBody))
-			reqCopy.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewBuffer(reqBody)), nil }
+			reqCopy.Body = newBodyReader(reqBody)
+			reqCopy.GetBody = makeGetBody(reqBody)
 		}
 	}
 
 	return reqCopy, reqBody, nil
 }
 
-// CopyResponse 深拷贝 http.Response，Body 可重复读取
+// CopyResponse 深拷贝 http.Response，Body 可重复读取。
+//
+// 优化点：统一使用 bytes.NewReader 替代 bytes.NewBuffer。
 func CopyResponse(resp *http.Response, body []byte) (copyResponse *http.Response, rspBody []byte, err error) {
 	rspBody = body
 	if resp == nil {
 		return nil, nil, nil
 	}
 	respCopy := *resp // 浅拷贝结构体
-	respCopy.Header = deepCopyHeader(resp.Header)
-	respCopy.Trailer = deepCopyHeader(resp.Trailer)
+	respCopy.Header = resp.Header.Clone()
+	respCopy.Trailer = resp.Trailer.Clone()
 	if resp.Request != nil {
 		respCopy.Request = resp.Request // 已有 request 引用，不重复复制 body
 	} else {
 		respCopy.Request, _, _ = CopyRequest(resp.Request, nil)
 	}
-	// if err != nil {
-	// 	return nil, err
-	// }
+
 	if body != nil {
-		respCopy.Body = io.NopCloser(bytes.NewBuffer(body))
-		return &respCopy, body, nil // 如果有 body，则直接返回
+		respCopy.Body = newBodyReader(body)
+		return &respCopy, body, nil
 	}
 
 	if resp.Body != nil {
 		if resp.ContentLength == 0 {
-			// 如果内容为空，则直接返回空 body，不复制原始 response body，这样可以提升效率，同时能保持不修改原始 response body 对象，在（github.com/elazarl/goproxy 中会根据这个对象是否发生变化删除Content-length 字段 ,导致HEAD——没有body 请求无法中断）
-			respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+			// 内容为空，直接返回空 body，不读取原始 response body
+			// （在 github.com/elazarl/goproxy 中会根据 body 对象是否变化删除 Content-length，
+			//   导致 HEAD 无 body 请求无法中断）
+			respCopy.Body = newBodyReader(nil)
 		} else {
-			rspBody, err = pooledReadAll(resp.Body)
+			rspBody, err = io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
 				return nil, rspBody, err
 			}
 			// 恢复原始 response
-			resp.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+			resp.Body = newBodyReader(rspBody)
 			// 复制用 body
-			respCopy.Body = io.NopCloser(bytes.NewBuffer(rspBody))
+			respCopy.Body = newBodyReader(rspBody)
 		}
-
 	}
 
 	return &respCopy, rspBody, nil
